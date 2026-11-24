@@ -16,6 +16,10 @@ static bool         bWouldBeNewFrame = false;
 static unsigned int nLastFrameTime = 0;
 
 constexpr float kOriginalTimeStep = 50.0f / 30.0f;
+constexpr float kDMTimeStep = 50.0f / 51.0f;       // 0.98039216f (MTA classic 51 FPS DM/DD baseline)
+
+static float        s_fVehiclePhysicsTimeStep = kOriginalTimeStep;
+static unsigned int s_bDMPhysicsMode = 0;
 
 // Fixes player movement issue while aiming and walking on high FPS.
 // Only rescales the compare threshold; m_MoveCmd's reset is NOPed separately in InitHooks_FrameRateFixes.
@@ -87,7 +91,7 @@ static void __declspec(naked) HOOK_CHeli__ProcessFlyingCarStuff()
 
     end:
         fmul ds:[0xB7CB5C]          // CTimer::ms_fTimeStep
-        fdiv kOriginalTimeStep      // 1.666f
+        fdiv s_fVehiclePhysicsTimeStep
         fadd [esi+0x84C]
         jmp RETURN_CHeli__ProcessFlyingCarStuff
     }
@@ -220,13 +224,19 @@ static void __declspec(naked) HOOK_CTimer__Update()
         add esp, 0x4
 
         mov bWouldBeNewFrame, 0
+
+        cmp s_bDMPhysicsMode, 1
+        je dm_frame_update
+
         mov eax, nLastFrameTime
         add eax, 33                 // 33 = 1000 / 30
         mov ecx, ds:[0xB7CB84]      // CTimer::m_snTimeInMilliseconds
         cmp ecx, eax
         jb skip
 
+    dm_frame_update:
         mov bWouldBeNewFrame, 1
+        mov ecx, ds:[0xB7CB84]      // CTimer::m_snTimeInMilliseconds
         mov nLastFrameTime, ecx
         mov eax, ds:[0xB7CB4C]      // CTimer::m_FrameCounter
         inc eax
@@ -906,10 +916,10 @@ static uint8 __cdecl CalculateVehicleSleepFrameThreshold() noexcept
 
     // Scale the stationary vehicle damping velocity threshold (0.0045f in GTA:SA)
     // to preserve framerate-invariant stillness sensitivity across all framerates.
-    scaledVehicleStillVelocityThreshold = 0.0045f * (timeStep / kOriginalTimeStep);
+    scaledVehicleStillVelocityThreshold = 0.0045f * (timeStep / s_fVehiclePhysicsTimeStep);
 
     constexpr float originalSleepFrames = 10.0f;
-    const float     rawThreshold = originalSleepFrames * (kOriginalTimeStep / timeStep);
+    const float     rawThreshold = originalSleepFrames * (s_fVehiclePhysicsTimeStep / timeStep);
     return static_cast<uint8>(std::clamp(std::round(rawThreshold), 10.0f, 240.0f));
 }
 
@@ -1217,7 +1227,7 @@ static void __declspec(naked) HOOK_CPhysical__ApplyAirResistance()
     {
         fld ds:[0x862CD0]            // 0.99000001f
         fld ds:[0xB7CB5C]            // CTimer::ms_fTimeStep
-        fdiv kOriginalTimeStep            // 1.666f
+        fdiv s_fVehiclePhysicsTimeStep
         mov eax, 0x822130            // powf
         call eax
 
@@ -1249,7 +1259,7 @@ static void __declspec(naked) HOOK_CDoor__Process_ChassisImpulse()
     {
         fld ds:[0x872328]           // 0.025f (DOOR_APPLY_RATE_CHASSIS)
         fmul ds:[0xB7CB5C]          // CTimer::ms_fTimeStep
-        fdiv kOriginalTimeStep      // 50.0f / 30.0f (1.6666667f)
+        fdiv s_fVehiclePhysicsTimeStep
         fmul st, st(1)              // * z
         fadd dword ptr [esi+0x14]   // + m_fAngVel
         fstp dword ptr [esi+0x14]   // store m_fAngVel
@@ -1276,7 +1286,7 @@ static void __declspec(naked) HOOK_CDoor__Process_ChassisAngle()
         jz not_chassis
 
         fmul ds:[0xB7CB5C]          // CTimer::ms_fTimeStep
-        fdiv kOriginalTimeStep      // 50.0f / 30.0f (1.6666667f)
+        fdiv s_fVehiclePhysicsTimeStep
 
     not_chassis:
         fadd dword ptr [esi+0x0C]   // + m_fAngle
@@ -1296,7 +1306,7 @@ static void __declspec(naked) HOOK_VehicleRapidStopFix()
     {
         fld ds:[0xC2B9CC]            // mod_HandlingManager.m_fWheelFriction
         fmul ds:[0xB7CB5C]            // CTimer::ms_fTimeStep
-        fdiv kOriginalTimeStep            // 1.666f
+        fdiv s_fVehiclePhysicsTimeStep
         jmp RETURN_VehicleRapidStopFix
     }
     // clang-format on
@@ -1304,32 +1314,32 @@ static void __declspec(naked) HOOK_VehicleRapidStopFix()
 
 void CMultiplayerSA::SetRapidVehicleStopFixEnabled(bool enabled)
 {
-    if (m_isRapidVehicleStopFixEnabled == enabled)
-        return;
+    // Always ensure hooks are installed to prevent raw unpatched GTA:SA high-FPS bugs
+    EZHookInstall(CPhysical__ApplyAirResistance);
+
+    // CVehicle::ProcessWheel
+    HookInstall(0x6D6E69, (DWORD)HOOK_VehicleRapidStopFix<0x6D6E6F>, 6);
+    HookInstall(0x6D6EA8, (DWORD)HOOK_VehicleRapidStopFix<0x6D6EAE>, 6);
+
+    // CVehicle::ProcessBikeWheel
+    HookInstall(0x6D767F, (DWORD)HOOK_VehicleRapidStopFix<0x6D7685>, 6);
+    HookInstall(0x6D76AB, (DWORD)HOOK_VehicleRapidStopFix<0x6D76B1>, 6);
+    HookInstall(0x6D76CD, (DWORD)HOOK_VehicleRapidStopFix<0x6D76D3>, 6);
 
     if (enabled)
     {
-        EZHookInstall(CPhysical__ApplyAirResistance);
-
-        // CVehicle::ProcessWheel
-        HookInstall(0x6D6E69, (DWORD)HOOK_VehicleRapidStopFix<0x6D6E6F>, 6);
-        HookInstall(0x6D6EA8, (DWORD)HOOK_VehicleRapidStopFix<0x6D6EAE>, 6);
-
-        // CVehicle::ProcessBikeWheel
-        HookInstall(0x6D767F, (DWORD)HOOK_VehicleRapidStopFix<0x6D7685>, 6);
-        HookInstall(0x6D76AB, (DWORD)HOOK_VehicleRapidStopFix<0x6D76B1>, 6);
-        HookInstall(0x6D76CD, (DWORD)HOOK_VehicleRapidStopFix<0x6D76D3>, 6);
+        // Standard Fix Mode (glitch = false): calibrated to 30 FPS (Rockstar single-player)
+        s_fVehiclePhysicsTimeStep = kOriginalTimeStep;
+        s_bDMPhysicsMode = 0;
     }
     else
     {
-        MemCpy((void*)HOOKPOS_CPhysical__ApplyAirResistance, "\xD9\x46\x50\xD8\x0D", 5);
-
-        MemCpy((void*)0x6D6E69, "\xD9\x05\xCC\xB9\xC2\x00", 6);
-        MemCpy((void*)0x6D6EA8, "\xD9\x05\xCC\xB9\xC2\x00", 6);
-
-        MemCpy((void*)0x6D767F, "\xD9\x05\xCC\xB9\xC2\x00", 6);
-        MemCpy((void*)0x6D76AB, "\xD9\x05\xCC\xB9\xC2\x00", 6);
-        MemCpy((void*)0x6D76CD, "\xD9\x05\xCC\xB9\xC2\x00", 6);
+        // DM/DD Glitch Mode (glitch = true): calibrated to 51 FPS (MTA classic 1.5.9 baseline)
+        // Preserves 100% authentic MTA 1.5.9 51 FPS physics for DM/DD maps,
+        // while scaling against 51 FPS so that higher FPS does not cause rapid auto-braking
+        // or sluggish aerial rotation!
+        s_fVehiclePhysicsTimeStep = kDMTimeStep;
+        s_bDMPhysicsMode = 1;
     }
 
     m_isRapidVehicleStopFixEnabled = enabled;
